@@ -1,41 +1,32 @@
 pipeline {
 
     /*
-     * Jenkins itself is the main pipeline executor.
-     * Docker-related stages therefore use the Docker CLI
-     * installed in the Jenkins container, which connects
-     * to the separate Docker-in-Docker daemon.
+     * Jenkins is the main pipeline executor.
+     * Docker commands run through the Docker CLI installed
+     * in Jenkins and are handled by the DinD daemon.
      */
     agent any
 
-    /*
-     * Avoid Jenkins performing an automatic checkout.
-     * We create an explicit Checkout stage instead so that
-     * the pipeline flow is clear in the build logs.
-     */
     options {
+
+        // We perform checkout explicitly as a pipeline stage.
         skipDefaultCheckout(true)
+
+        // Add timestamps to console logs.
         timestamps()
-        buildDiscarder(logRotator(numToKeepStr: '20'))
+
+        // Keep only the latest 20 builds.
+        buildDiscarder(
+            logRotator(numToKeepStr: '20')
+        )
     }
 
     environment {
 
-        /*
-         * CHANGE THIS to your real Docker Hub username.
-         *
-         * Example:
-         * DOCKER_IMAGE = 'dave123/isec6000-node-app'
-         */
+        // Docker Hub repository.
         DOCKER_IMAGE = 'yuguanghao/isec6000-node-app'
 
-        /*
-         * Every Jenkins build receives a unique number.
-         * That number is used as the Docker image tag.
-         *
-         * Example:
-         * Build #5 -> isec6000-node-app:5
-         */
+        // Use Jenkins build number as the Docker image tag.
         IMAGE_TAG = "${BUILD_NUMBER}"
     }
 
@@ -44,10 +35,7 @@ pipeline {
         stage('Checkout') {
             steps {
 
-                /*
-                 * Checkout the Git repository that contains
-                 * this Jenkinsfile.
-                 */
+                // Checkout the repository containing this Jenkinsfile.
                 checkout scm
             }
         }
@@ -56,11 +44,8 @@ pipeline {
         stage('Install Dependencies') {
 
             /*
-             * The assignment requires Node 16 to be used
-             * as the build agent.
-             *
-             * reuseNode keeps the same Jenkins workspace
-             * mounted into this temporary Node 16 container.
+             * The assignment requires Node 16
+             * to be used as the build agent.
              */
             agent {
                 docker {
@@ -72,17 +57,11 @@ pipeline {
 
             steps {
 
-                /*
-                 * Print versions into the Jenkins log so that
-                 * we have evidence that Node 16 was used.
-                 */
+                // Record Node and npm versions in Jenkins logs.
                 sh 'node --version'
                 sh 'npm --version'
 
-                /*
-                 * npm ci installs exactly the dependencies
-                 * recorded in package-lock.json.
-                 */
+                // Install exact dependencies from package-lock.json.
                 sh 'npm ci'
             }
         }
@@ -101,12 +80,24 @@ pipeline {
             steps {
 
                 /*
-                 * Runs the test script defined in package.json.
+                 * Save the unit-test output into a file
+                 * while also displaying it in Jenkins logs.
                  *
-                 * If the test returns a non-zero exit code,
-                 * Jenkins automatically fails this stage.
+                 * The original npm test exit status is preserved,
+                 * so a failed test still fails the pipeline.
                  */
-                sh 'npm test'
+                sh '''
+                    set +e
+
+                    npm test > test-result.txt 2>&1
+                    status=$?
+
+                    set -e
+
+                    cat test-result.txt
+
+                    exit $status
+                '''
             }
         }
 
@@ -124,14 +115,21 @@ pipeline {
             steps {
 
                 /*
-                 * Dependency vulnerability security gate.
+                 * Generate a machine-readable vulnerability report.
                  *
-                 * Low / Moderate:
-                 * reported, but pipeline may continue.
+                 * "|| true" prevents report generation itself from
+                 * stopping the pipeline when vulnerabilities exist.
+                 */
+                sh 'npm audit --json > npm-audit.json || true'
+
+                /*
+                 * Security gate:
                  *
-                 * High / Critical:
-                 * npm audit returns a non-zero exit code,
-                 * causing the Jenkins pipeline to fail.
+                 * Low / Moderate vulnerabilities:
+                 * reported but pipeline may continue.
+                 *
+                 * High / Critical vulnerabilities:
+                 * npm returns a non-zero exit code and Jenkins fails.
                  */
                 sh 'npm audit --audit-level=high'
             }
@@ -142,11 +140,8 @@ pipeline {
             steps {
 
                 /*
-                 * This command runs in the Jenkins container.
-                 *
-                 * The Docker CLI inside Jenkins connects through
-                 * TLS to the Docker daemon running in the DinD
-                 * container configured in Task 2.
+                 * Docker CLI inside Jenkins communicates with
+                 * the separate Docker-in-Docker daemon.
                  */
                 sh '''
                     docker build \
@@ -161,9 +156,9 @@ pipeline {
             steps {
 
                 /*
-                 * Docker Hub username and PAT are retrieved from
-                 * Jenkins Credentials rather than being stored
-                 * directly in this Jenkinsfile.
+                 * Retrieve Docker Hub username and PAT from
+                 * Jenkins Credentials rather than hard-coding
+                 * secrets in the Jenkinsfile.
                  */
                 withCredentials([
                     usernamePassword(
@@ -193,19 +188,31 @@ pipeline {
     post {
 
         success {
-            echo "Pipeline completed successfully."
+            echo 'Pipeline completed successfully.'
             echo "Published image: ${DOCKER_IMAGE}:${IMAGE_TAG}"
         }
 
+
         failure {
-            echo "Pipeline failed. Check the failed stage and console log."
+            echo 'Pipeline failed. Check the failed stage and console logs.'
         }
+
 
         always {
 
             /*
-             * Make sure Docker login information is removed
-             * even if a later command fails.
+             * Archive important build artifacts so that
+             * test and security results can be reviewed later.
+             */
+            archiveArtifacts(
+                artifacts: 'test-result.txt,npm-audit.json',
+                fingerprint: true,
+                allowEmptyArchive: true
+            )
+
+            /*
+             * Ensure Docker authentication information
+             * is removed after the build.
              */
             sh 'docker logout >/dev/null 2>&1 || true'
 
